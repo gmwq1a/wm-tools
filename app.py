@@ -1,11 +1,16 @@
 # 万事屋去水印后端:图片去水印(IOPaint LaMa)+ 视频打码(ffmpeg boxblur)
 # 单进程 FastAPI;LaMa 模型懒加载(免费实例 512MB,端口必须先起来过健康检查)。
+# 视频打码为异步 job 模式:POST 立即返回 job_id,后台线程跑 ffmpeg,
+# 页面轮询 GET /api/video/mosaic/{job_id} 拿状态,完成后 /result 取片。
+# (同步长请求会被中间代理在 ~60s 掐断,浏览器表现为 Failed to fetch。)
 import io
 import json
 import os
 import subprocess
 import tempfile
+import threading
 import time
+import uuid
 from collections import defaultdict
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
@@ -24,6 +29,7 @@ MAX_VIDEO_SECONDS = 300
 RATE_WINDOW = 60          # seconds
 RATE_IMAGE = 10           # per window per IP
 RATE_VIDEO = 3
+JOB_TTL = 900             # 结果保留 15 分钟
 
 app = FastAPI(title="wm-tools")
 app.add_middleware(
@@ -34,6 +40,8 @@ app.add_middleware(
 )
 
 _hits = defaultdict(list)
+_jobs = {}                # job_id -> dict(status, error, dst, tmpdir, created, done_at)
+_jobs_lock = threading.Lock()
 
 
 def rate_ok(ip: str, bucket: str, limit: int) -> bool:
@@ -44,6 +52,16 @@ def rate_ok(ip: str, bucket: str, limit: int) -> bool:
         return False
     _hits[key].append(now)
     return True
+
+
+def _sweep_jobs():
+    import shutil
+    now = time.time()
+    with _jobs_lock:
+        old = [k for k, j in _jobs.items() if now - j["created"] > JOB_TTL]
+        dirs = [_jobs.pop(k)["tmpdir"] for k in old]
+    for d in dirs:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 _model = None
@@ -73,9 +91,51 @@ def _probe(path):
     return dur, (width, height)
 
 
+def _run_mosaic(job_id, src, dst, boxes, strength, need_scale):
+    try:
+        n = len(boxes)
+        pre = "[0:v]scale=1280:-2[sc];" if need_scale else ""
+        srcv = "[sc]" if need_scale else "[0:v]"
+        parts = [pre + f"{srcv}split={n + 1}" + "".join(f"[s{i}]" for i in range(n + 1))]
+        last = f"[s{n}]"
+        for i, (x, y, w, h) in enumerate(boxes):
+            parts.append(f"[s{i}]crop={w}:{h}:{x}:{y},boxblur={strength}[b{i}]")
+            parts.append(f"{last}[b{i}]overlay={x}:{y}[v{i}]")
+            last = f"[v{i}]"
+        cmd = ["ffmpeg", "-y", "-i", src, "-filter_complex", ";".join(parts),
+               "-map", last, "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast",
+               "-crf", "23", "-c:a", "copy", "-movflags", "+faststart", dst]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=560)
+        with _jobs_lock:
+            j = _jobs.get(job_id)
+            if j is None:
+                return
+            if proc.returncode != 0 or not os.path.exists(dst):
+                j["status"] = "error"
+                j["error"] = "ffmpeg_failed"
+                j["tail"] = (proc.stderr or "")[-300:]
+            else:
+                j["status"] = "done"
+                j["done_at"] = time.time()
+    except subprocess.TimeoutExpired:
+        with _jobs_lock:
+            j = _jobs.get(job_id)
+            if j is not None:
+                j["status"] = "error"
+                j["error"] = "ffmpeg_timeout"
+    except Exception as e:
+        with _jobs_lock:
+            j = _jobs.get(job_id)
+            if j is not None:
+                j["status"] = "error"
+                j["error"] = "worker_error"
+                j["tail"] = str(e)[-200:]
+
+
 @app.post("/api/video/mosaic")
 async def video_mosaic(request: Request, video: UploadFile = File(...), regions: str = Form(default=""),
                        strength: int = Form(default=12)):
+    _sweep_jobs()
     ip = request.client.host if request.client else "?"
     if not rate_ok(ip, "vid", RATE_VIDEO):
         return JSONResponse({"success": False, "error": "rate_limited"}, 429)
@@ -94,9 +154,7 @@ async def video_mosaic(request: Request, video: UploadFile = File(...), regions:
     if dur > MAX_VIDEO_SECONDS:
         return JSONResponse({"success": False, "error": f"video_too_long_max_{MAX_VIDEO_SECONDS}s"}, 413)
     W, H = wh
-    # 超宽视频先压到 1280 宽再打码,省内存省 CPU
     need_scale = W > 1280
-    # 默认区域:抖音双角落水印(右上昵称/抖音号、左下 @账号),按比例
     if regions.strip():
         try:
             boxes = json.loads(regions)
@@ -111,25 +169,39 @@ async def video_mosaic(request: Request, video: UploadFile = File(...), regions:
     boxes = [(max(0, x), max(0, y), min(w, W - x), min(h, H - y)) for x, y, w, h in boxes if w > 4 and h > 4]
     if not boxes:
         return JSONResponse({"success": False, "error": "no_valid_regions"}, 400)
-    n = len(boxes)
-    pre = "[0:v]scale=1280:-2[sc];" if need_scale else ""
-    srcv = "[sc]" if need_scale else "[0:v]"
     if need_scale:
         sx = 1280 / W
         boxes = [(int(x * sx), int(y * sx), max(6, int(w * sx)), max(6, int(h * sx))) for x, y, w, h in boxes]
-    parts = [pre + f"{srcv}split={n + 1}" + "".join(f"[s{i}]" for i in range(n + 1))]
-    last = f"[s{n}]"
-    for i, (x, y, w, h) in enumerate(boxes):
-        parts.append(f"[s{i}]crop={w}:{h}:{x}:{y},boxblur={strength}[b{i}]")
-        parts.append(f"{last}[b{i}]overlay={x}:{y}[v{i}]")
-        last = f"[v{i}]"
-    cmd = ["ffmpeg", "-y", "-i", src, "-filter_complex", ";".join(parts),
-           "-map", last, "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast",
-           "-crf", "23", "-c:a", "copy", "-movflags", "+faststart", dst]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=560)
-    except subprocess.TimeoutExpired:
-        return JSONResponse({"success": False, "error": "ffmpeg_timeout"}, 500)
-    if proc.returncode != 0 or not os.path.exists(dst):
-        return JSONResponse({"success": False, "error": "ffmpeg_failed", "tail": (proc.stderr or "")[-300:]}, 500)
+    job_id = uuid.uuid4().hex[:12]
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "running", "error": None, "dst": dst,
+                         "tmpdir": tmpdir, "created": time.time(), "done_at": None}
+    t = threading.Thread(target=_run_mosaic, args=(job_id, src, dst, boxes, strength, need_scale), daemon=True)
+    t.start()
+    return {"success": True, "job_id": job_id}
+
+
+@app.get("/api/video/mosaic/{job_id}")
+def mosaic_status(job_id: str):
+    with _jobs_lock:
+        j = _jobs.get(job_id)
+        if j is None:
+            return JSONResponse({"success": False, "error": "job_not_found"}, 404)
+        out = {"success": True, "status": j["status"], "elapsed": int(time.time() - j["created"])}
+        if j["status"] == "error":
+            out["error"] = j.get("error") or "unknown"
+            if j.get("tail"):
+                out["tail"] = j["tail"]
+        return out
+
+
+@app.get("/api/video/mosaic/{job_id}/result")
+def mosaic_result(job_id: str):
+    with _jobs_lock:
+        j = _jobs.get(job_id)
+        if j is None:
+            return JSONResponse({"success": False, "error": "job_not_found"}, 404)
+        if j["status"] != "done":
+            return JSONResponse({"success": False, "error": "not_ready"}, 409)
+        dst = j["dst"]
     return FileResponse(dst, media_type="video/mp4", filename="mosaicked.mp4")
