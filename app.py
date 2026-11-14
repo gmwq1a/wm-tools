@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 ALLOWED_ORIGINS = [
     "https://wanshiwu.surge.sh",
     "https://geshi-gongfang.surge.sh",
+    "https://wanshiwu-preview.onrender.com",
 ]
 MAX_IMAGE_SIDE = 768
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
