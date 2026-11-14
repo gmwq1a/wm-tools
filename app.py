@@ -354,3 +354,187 @@ def audio_result(job_id: str, format: str = "mp3"):
     if format == "wav":
         return FileResponse(j["dst_wav"], media_type="audio/wav", filename=f"{j['effect']}.wav")
     return FileResponse(j["dst"], media_type="audio/mpeg", filename=f"{j['effect']}.mp3")
+
+
+# ---------- yt-dlp 通用解析层（字幕猫线） ----------
+RATE_PARSE = 6
+RATE_PMEDIA = 30
+PARSE_TIMEOUT = 60
+PMEDIA_MAX = 400 * 1024 * 1024   # 400MB 中转上限
+PMEDIA_TOTAL_MS = 10 * 60 * 1000
+UA_DESKTOP = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+_RUTUBE_HOST = __import__("re").compile(r"(^|\.)(rutube\.ru|rtbcdn\.ru)$", __import__("re").I)
+
+
+def _parse_error_classify(msg):
+    m = (msg or "").lower()
+    if any(k in m for k in ("sign in", "log in", "login required", "registered users", "private video", "members-only", "confirm your age", "confirm you")):
+        return ("auth-required", "需要登录或账号验证才能解析这个平台（常见于 YouTube/IG 对数据中心 IP 的风控）")
+    if any(k in m for k in ("429", "too many requests", "captcha", "bot", "unusual traffic")):
+        return ("platform-blocked", "平台风控拦截，稍后重试或换平台")
+    if any(k in m for k in ("country", "geo", "region", "location")):
+        return ("geo-blocked", "这段内容在当前地区不可看")
+    if any(k in m for k in ("unavailable", "404", "not found", "removed", "deleted", "does not exist", "410")):
+        return ("not-found", "链接已失效或内容已删除")
+    if any(k in m for k in ("unsupported url", "no video", "unable to extract")):
+        return ("unsupported", "这个平台/链接形式解析不了")
+    return ("parse-failed", "解析失败：" + (msg or "unknown")[:120])
+
+
+def _media_list(info):
+    out = []
+    for f in info.get("formats") or []:
+        u = f.get("url")
+        if not u:
+            continue
+        vcodec, acodec = f.get("vcodec"), f.get("acodec")
+        has_v = vcodec and vcodec != "none"
+        has_a = acodec and acodec != "none"
+        if not (has_v or has_a):
+            continue
+        kind = "video" if has_v else "audio"
+        if has_v and has_a:
+            kind = "video"
+        label = f.get("format_note") or (f"{f.get('height')}p" if f.get("height") else None) or f.get("format_id") or "unknown"
+        if has_v and not has_a:
+            label = str(label) + "（无声轨）"
+        out.append({"kind": kind, "label": str(label), "url": u,
+                    "ext": f.get("ext"), "filesize": f.get("filesize") or f.get("filesize_approx")})
+    # 去重保序，最多 20 条
+    seen, dedup = set(), []
+    for m in out:
+        if m["url"] in seen:
+            continue
+        seen.add(m["url"])
+        dedup.append(m)
+        if len(dedup) >= 20:
+            break
+    return dedup
+
+
+def _subtitle_list(info):
+    out = []
+    subs = info.get("subtitles") or {}   # 只取平台官方轨，自动生成的 automatic_captions 不算
+    pref = ["vtt", "srt", "srv3", "ttml", "json3"]
+    for lang, tracks in subs.items():
+        tracks = [t for t in tracks if t.get("url")]
+        if not tracks:
+            continue
+        tracks.sort(key=lambda t: pref.index(t.get("ext")) if t.get("ext") in pref else 99)
+        t = tracks[0]
+        out.append({"lang": lang, "format": t.get("ext"), "url": t["url"]})
+    return out
+
+
+@app.post("/api/parse")
+async def parse_url(request: Request):
+    ip = request.client.host if request.client else "unknown"
+    if not rate_ok(ip, "parse", RATE_PARSE):
+        return JSONResponse({"ok": False, "kind": "rate-limited", "error": "请求太频繁，歇几秒再试"}, status_code=429)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "kind": "invalid-request", "error": "body 需要 JSON：{\"url\": \"...\"}"}, status_code=400)
+    url = (body or {}).get("url") or ""
+    if not __import__("re").match(r"^https?://", url):
+        return JSONResponse({"ok": False, "kind": "invalid-request", "error": "url 需要 http(s) 链接"}, status_code=400)
+
+    import asyncio
+    cmd = ["python3", "-m", "yt_dlp", "-J", "--no-playlist", "--no-warnings",
+           "--socket-timeout", "20", "--retries", "1", url]
+    env = dict(os.environ, YTDLP_NO_UPDATE="1")
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=PARSE_TIMEOUT)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return JSONResponse({"ok": False, "kind": "timeout", "error": "解析超时（60秒），平台可能风控或链接太重"}, status_code=504)
+    if proc.returncode != 0:
+        kind, msg = _parse_error_classify(stderr.decode("utf-8", "replace"))
+        status = 404 if kind == "not-found" else (403 if kind in ("auth-required", "platform-blocked", "geo-blocked") else 422)
+        return JSONResponse({"ok": False, "kind": kind, "error": msg}, status_code=status)
+    try:
+        info = json.loads(stdout.decode("utf-8", "replace"))
+    except Exception:
+        return JSONResponse({"ok": False, "kind": "parse-failed", "error": "yt-dlp 输出无法解读"}, status_code=502)
+    return {"ok": True,
+            "title": info.get("title"),
+            "duration_s": info.get("duration"),
+            "thumbnail": info.get("thumbnail"),
+            "media": _media_list(info),
+            "subtitles": _subtitle_list(info),
+            "source": "yt-dlp"}
+
+
+@app.get("/api/proxy-media")
+async def proxy_media(request: Request, url: str = "", ref: str = ""):
+    ip = request.client.host if request.client else "unknown"
+    if not rate_ok(ip, "pmedia", RATE_PMEDIA):
+        return JSONResponse({"ok": False, "kind": "rate-limited", "error": "请求太频繁"}, status_code=429)
+    if not __import__("re").match(r"^https?://", url or ""):
+        return JSONResponse({"ok": False, "kind": "invalid-request", "error": "url 需要 http(s) 链接"}, status_code=400)
+    import urllib.parse
+    host = urllib.parse.urlparse(url).hostname or ""
+    headers = {"User-Agent": UA_DESKTOP, "Accept": "*/*"}
+    if _RUTUBE_HOST.search(host):
+        headers["Referer"] = "https://rutube.ru/"
+    elif ref and __import__("re").match(r"^https?://", ref):
+        headers["Referer"] = ref
+    rng = request.headers.get("range")
+    if rng:
+        headers["Range"] = rng
+
+    import httpx
+    client = httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(30.0, read=300.0))
+    try:
+        upstream = await client.send(httpx.Request("GET", url, headers=headers), stream=True)
+    except Exception as e:
+        await client.aclose()
+        return JSONResponse({"ok": False, "kind": "network", "error": "连接目标失败：" + str(e)[:80]}, status_code=502)
+    if upstream.status_code not in (200, 206):
+        body_head = (await upstream.aread())[:0]
+        st = upstream.status_code
+        await upstream.aclose()
+        await client.aclose()
+        if st in (401, 403):
+            kind, msg = "access-denied", "目标网站拒绝（HTTP %d，防盗链或需要登录态）" % st
+        elif st in (404, 410):
+            kind, msg = "not-found", "文件已失效（HTTP %d），重新解析拿新地址" % st
+        elif st in (412, 429):
+            kind, msg = "platform-blocked", "目标网站风控拦截（HTTP %d）" % st
+        else:
+            kind, msg = "network", "目标网站返回 HTTP %d" % st
+        return JSONResponse({"ok": False, "kind": kind, "error": msg}, status_code=502)
+
+    clen = int(upstream.headers.get("content-length") or 0)
+    if clen > PMEDIA_MAX:
+        await upstream.aclose()
+        await client.aclose()
+        return JSONResponse({"ok": False, "kind": "too-large", "error": "文件超过 400MB 中转上限"}, status_code=413)
+
+    from starlette.responses import StreamingResponse
+    out_headers = {"Accept-Ranges": upstream.headers.get("accept-ranges") or "bytes",
+                   "Cache-Control": "public, max-age=3600"}
+    ct = upstream.headers.get("content-type")
+    if ct:
+        out_headers["Content-Type"] = ct
+    cr = upstream.headers.get("content-range")
+    if cr:
+        out_headers["Content-Range"] = cr
+    if clen:
+        out_headers["Content-Length"] = str(clen)
+
+    async def streamer():
+        sent = 0
+        try:
+            async for chunk in upstream.aiter_bytes(65536):
+                sent += len(chunk)
+                if sent > PMEDIA_MAX:
+                    break
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    return StreamingResponse(streamer(), status_code=upstream.status_code, headers=out_headers)
