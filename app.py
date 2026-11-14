@@ -236,3 +236,120 @@ async def video_mosaic_sync(request: Request, video: UploadFile = File(...), reg
         await asyncio.sleep(2)
     return JSONResponse({"success": False, "error": "timeout"}, 504)
 
+
+
+# ---------- 云端滤镜（voice_dsp 37 效果） ----------
+RATE_AUDIO = 5
+AUDIO_MAX_SECONDS = 300
+
+EFFECT_META = {
+    # 环境空间
+    "room": ("小房间", "环境空间"), "corridor": ("走廊", "环境空间"),
+    "cockpit": ("驾驶舱", "环境空间"), "close": ("贴耳近场", "环境空间"),
+    "far": ("远景回荡", "环境空间"), "submarine": ("深海潜艇", "环境空间"),
+    "temple": ("哥特圣殿", "环境空间"), "cathedral": ("大教堂", "环境空间"),
+    # 设备介质
+    "phone": ("老式电话", "设备介质"), "radio40": ("1940s收音机", "设备介质"),
+    "gramophone": ("留声机", "设备介质"), "megaphone": ("扩音喇叭", "设备介质"),
+    "underwater": ("水下", "设备介质"), "wall": ("隔墙听", "设备介质"),
+    "tv": ("电视喇叭", "设备介质"), "cassette": ("磁带", "设备介质"),
+    "walkie": ("步话机", "设备介质"), "vinyl": ("黑胶", "设备介质"),
+    "helmet": ("宇航员头盔", "设备介质"),
+    # 变声
+    "kid": ("幼化", "变声"), "giant": ("巨人化", "变声"),
+    "ringmod": ("机器人", "变声"), "chipmunk": ("花栗鼠", "变声"),
+    "demon": ("恶魔低语", "变声"), "harmony": ("和声分身", "变声"),
+    "robot": ("失控AI", "变声"),
+    # 调制
+    "vibrato": ("颤音", "调制"), "tremolo": ("震音", "调制"),
+    "phaser": ("相位", "调制"), "pingpong": ("乒乓延迟", "调制"),
+    "autowah": ("自动哇音", "调制"),
+    # 动态与创意
+    "radioloud": ("广播响度压限", "动态创意"), "reverse": ("倒放", "动态创意"),
+    "slow": ("慢速拉伸", "动态创意"), "bit8": ("8-bit游戏机", "动态创意"),
+    "binaural": ("双耳3D环绕", "动态创意"), "heartbeat": ("心跳呼吸氛围", "动态创意"),
+}
+
+
+@app.get("/api/audio/effects")
+def audio_effects():
+    return {"effects": [{"name": n, "label": EFFECT_META[n][0], "category": EFFECT_META[n][1]}
+                        for n in __import__("voice_dsp").EFFECTS],
+            "max_seconds": AUDIO_MAX_SECONDS}
+
+
+def _run_audio_fx(job_id, src_wav, dst_wav, dst_mp3, name):
+    try:
+        import voice_dsp
+        sr, x = voice_dsp.read_wav(src_wav)
+        y = voice_dsp.fx(name, x, sr)
+        voice_dsp.write_wav(dst_wav, sr, y)
+        subprocess.run(["ffmpeg", "-y", "-i", dst_wav, "-codec:a", "libmp3lame", "-q:a", "4", dst_mp3],
+                       check=True, capture_output=True)
+        with _jobs_lock:
+            _jobs[job_id].update(status="done", done_at=time.time())
+    except Exception as e:
+        with _jobs_lock:
+            _jobs[job_id].update(status="failed", error=f"audio_fx_failed: {e}")
+
+
+@app.post("/api/audio/jobs")
+async def audio_fx_job(request: Request, audio: UploadFile = File(...), effect: str = Form(...)):
+    ip = request.client.host if request.client else "unknown"
+    if not rate_ok(ip, "aud", RATE_AUDIO):
+        return JSONResponse({"error": "rate_limited", "message": "请求太频繁，歇几秒再试"}, status_code=429)
+    import voice_dsp
+    if effect not in voice_dsp.EFFECTS:
+        return JSONResponse({"error": "unknown_effect",
+                             "message": f"未知效果: {effect}，可用清单见 /api/audio/effects"}, status_code=400)
+    tmpdir = tempfile.mkdtemp(prefix="audjob_")
+    raw = os.path.join(tmpdir, "input" + os.path.splitext(audio.filename or "")[1][:8])
+    with open(raw, "wb") as f:
+        f.write(await audio.read())
+    src_wav = os.path.join(tmpdir, "input.wav")
+    r = subprocess.run(["ffmpeg", "-y", "-i", raw, "-ac", "1", "-ar", "44100", "-f", "wav", src_wav],
+                       capture_output=True)
+    if r.returncode != 0 or not os.path.exists(src_wav):
+        return JSONResponse({"error": "decode_failed",
+                             "message": "音频解码失败，支持 wav/mp3/m4a/ogg 等常见格式"}, status_code=400)
+    import voice_dsp as vd
+    sr, x = vd.read_wav(src_wav)
+    duration = len(x) / sr
+    del x
+    if duration > AUDIO_MAX_SECONDS:
+        return JSONResponse({"error": "too_long", "limit_s": AUDIO_MAX_SECONDS,
+                             "duration_s": round(duration, 1),
+                             "message": f"这段音频 {duration:.0f} 秒，超过云端滤镜 {AUDIO_MAX_SECONDS//60} 分钟上限；更长的请拆段或走 Colab"}, status_code=413)
+    job_id = uuid.uuid4().hex[:12]
+    dst_wav = os.path.join(tmpdir, "result.wav")
+    dst_mp3 = os.path.join(tmpdir, "result.mp3")
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "running", "error": None, "dst": dst_mp3, "dst_wav": dst_wav,
+                         "tmpdir": tmpdir, "created": time.time(), "done_at": None,
+                         "effect": effect, "duration_s": round(duration, 1)}
+    t = threading.Thread(target=_run_audio_fx, args=(job_id, src_wav, dst_wav, dst_mp3, effect), daemon=True)
+    t.start()
+    return {"job_id": job_id, "status": "queued", "effect": effect, "duration_s": round(duration, 1)}
+
+
+@app.get("/api/audio/jobs/{job_id}")
+def audio_status(job_id: str):
+    with _jobs_lock:
+        j = _jobs.get(job_id)
+    if not j:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    return {"job_id": job_id, "status": j["status"], "error": j["error"],
+            "effect": j.get("effect"), "duration_s": j.get("duration_s")}
+
+
+@app.get("/api/audio/jobs/{job_id}/result")
+def audio_result(job_id: str, format: str = "mp3"):
+    with _jobs_lock:
+        j = _jobs.get(job_id)
+    if not j:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    if j["status"] != "done":
+        return JSONResponse({"error": "not_ready", "status": j["status"], "detail": j["error"]}, status_code=409)
+    if format == "wav":
+        return FileResponse(j["dst_wav"], media_type="audio/wav", filename=f"{j['effect']}.wav")
+    return FileResponse(j["dst"], media_type="audio/mpeg", filename=f"{j['effect']}.mp3")
