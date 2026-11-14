@@ -61,6 +61,7 @@ def get_model():
     return _model
 
 
+@app.get("/")
 @app.get("/health")
 def health():
     return {"ok": True, "ts": int(time.time())}
