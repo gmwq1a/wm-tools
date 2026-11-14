@@ -132,8 +132,8 @@ def _run_mosaic(job_id, src, dst, boxes, strength, need_scale):
                 j["tail"] = str(e)[-200:]
 
 
-@app.post("/api/video/mosaic")
-async def video_mosaic(request: Request, video: UploadFile = File(...), regions: str = Form(default=""),
+@app.post("/api/video/jobs")
+async def video_mosaic_job(request: Request, video: UploadFile = File(...), regions: str = Form(default=""),
                        strength: int = Form(default=12)):
     _sweep_jobs()
     ip = request.client.host if request.client else "?"
@@ -181,7 +181,7 @@ async def video_mosaic(request: Request, video: UploadFile = File(...), regions:
     return {"success": True, "job_id": job_id}
 
 
-@app.get("/api/video/mosaic/{job_id}")
+@app.get("/api/video/jobs/{job_id}")
 def mosaic_status(job_id: str):
     with _jobs_lock:
         j = _jobs.get(job_id)
@@ -195,7 +195,7 @@ def mosaic_status(job_id: str):
         return out
 
 
-@app.get("/api/video/mosaic/{job_id}/result")
+@app.get("/api/video/jobs/{job_id}/result")
 def mosaic_result(job_id: str):
     with _jobs_lock:
         j = _jobs.get(job_id)
@@ -205,3 +205,30 @@ def mosaic_result(job_id: str):
             return JSONResponse({"success": False, "error": "not_ready"}, 409)
         dst = j["dst"]
     return FileResponse(dst, media_type="video/mp4", filename="mosaicked.mp4")
+
+@app.post("/api/video/mosaic")
+async def video_mosaic_sync(request: Request, video: UploadFile = File(...), regions: str = Form(default=""),
+                            strength: int = Form(default=12)):
+    """兼容旧版同步页面:内部走 job,原地等结果后直接返回 MP4。
+    注意:长任务(>60s)仍可能被中间代理掐断,新页面请用 /api/video/jobs 异步模式。"""
+    resp = await video_mosaic_job(request, video, regions, strength)
+    if isinstance(resp, JSONResponse):
+        return resp
+    job_id = resp["job_id"]
+    deadline = time.time() + 580
+    while time.time() < deadline:
+        with _jobs_lock:
+            j = _jobs.get(job_id)
+        if j is None:
+            return JSONResponse({"success": False, "error": "job_lost"}, 500)
+        if j["status"] == "done":
+            return FileResponse(j["dst"], media_type="video/mp4", filename="mosaicked.mp4")
+        if j["status"] == "error":
+            out = {"success": False, "error": j.get("error") or "unknown"}
+            if j.get("tail"):
+                out["tail"] = j["tail"]
+            return JSONResponse(out, 500)
+        import asyncio
+        await asyncio.sleep(2)
+    return JSONResponse({"success": False, "error": "timeout"}, 504)
+
