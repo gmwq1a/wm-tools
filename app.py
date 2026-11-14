@@ -99,7 +99,11 @@ def _run_mosaic(job_id, src, dst, boxes, strength, need_scale):
         parts = [pre + f"{srcv}split={n + 1}" + "".join(f"[s{i}]" for i in range(n + 1))]
         last = f"[s{n}]"
         for i, (x, y, w, h) in enumerate(boxes):
-            parts.append(f"[s{i}]crop={w}:{h}:{x}:{y},boxblur={strength}[b{i}]")
+            # boxblur radius is capped per plane: chroma (4:2:0) is half-size,
+            # so max radius = (min(w,h)/2 - 1) / 2. Clamp or ffmpeg EINVALs on
+            # small regions (e.g. 208x31 douyin corner boxes at strength 12).
+            r = max(1, min(strength, (min(w, h) - 2) // 4))
+            parts.append(f"[s{i}]crop={w}:{h}:{x}:{y},boxblur={r}[b{i}]")
             parts.append(f"{last}[b{i}]overlay={x}:{y}[v{i}]")
             last = f"[v{i}]"
         cmd = ["ffmpeg", "-y", "-i", src, "-filter_complex", ";".join(parts),
