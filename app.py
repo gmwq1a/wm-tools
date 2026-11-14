@@ -18,7 +18,7 @@ ALLOWED_ORIGINS = [
     "https://wanshiwu.surge.sh",
     "https://geshi-gongfang.surge.sh",
 ]
-MAX_IMAGE_SIDE = 1024
+MAX_IMAGE_SIDE = 768
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_VIDEO_BYTES = 150 * 1024 * 1024
 MAX_VIDEO_SECONDS = 300
@@ -50,15 +50,27 @@ def rate_ok(ip: str, bucket: str, limit: int) -> bool:
 _model = None
 
 
-def get_model():
-    global _model
-    if _model is None:
-        import torch
-        torch.set_num_threads(1)
-        from iopaint.model_manager import ModelManager
-        from iopaint.schema import Device
-        _model = ModelManager(name="lama", device=Device.cpu)
-    return _model
+def _load_model():
+    import torch
+    torch.set_num_threads(1)
+    from iopaint.model_manager import ModelManager
+    from iopaint.schema import Device
+    return ModelManager(name="lama", device=Device.cpu)
+
+
+def _unload_model(m):
+    # 512MB 实例:用完立即释放,下次请求重新加载(约 10-20s)
+    import gc
+    try:
+        del m
+    except Exception:
+        pass
+    gc.collect()
+    try:
+        from iopaint.helper import torch_gc
+        torch_gc()
+    except Exception:
+        pass
 
 
 @app.get("/")
@@ -88,7 +100,11 @@ async def image_dewatermark(request: Request, image: UploadFile = File(...), mas
     _, msk = cv2.threshold(msk, 127, 255, cv2.THRESH_BINARY)
     msk = cv2.dilate(msk, np.ones((5, 5), np.uint8), iterations=1)
     from iopaint.schema import InpaintRequest
-    result = get_model()(img, msk, InpaintRequest())  # output is BGR, encode directly
+    model = _load_model()
+    try:
+        result = model(img, msk, InpaintRequest())  # output is BGR, encode directly
+    finally:
+        _unload_model(model)
     ok, buf = cv2.imencode(".png", result.astype(np.uint8))
     if not ok:
         return JSONResponse({"success": False, "error": "encode_failed"}, 500)
@@ -134,6 +150,8 @@ async def video_mosaic(request: Request, video: UploadFile = File(...), regions:
     if dur > MAX_VIDEO_SECONDS:
         return JSONResponse({"success": False, "error": f"video_too_long_max_{MAX_VIDEO_SECONDS}s"}, 413)
     W, H = wh
+    # 超宽视频先压到 1280 宽再打码,省内存省 CPU
+    need_scale = W > 1280
     # 默认区域:抖音双角落水印(右上昵称/抖音号、左下 @账号),按比例
     if regions.strip():
         try:
@@ -150,7 +168,12 @@ async def video_mosaic(request: Request, video: UploadFile = File(...), regions:
     if not boxes:
         return JSONResponse({"success": False, "error": "no_valid_regions"}, 400)
     n = len(boxes)
-    parts = [f"[0:v]split={n + 1}" + "".join(f"[s{i}]" for i in range(n + 1))]
+    pre = "[0:v]scale=1280:-2[sc];" if need_scale else ""
+    srcv = "[sc]" if need_scale else "[0:v]"
+    if need_scale:
+        sx = 1280 / W
+        boxes = [(int(x * sx), int(y * sx), max(6, int(w * sx)), max(6, int(h * sx))) for x, y, w, h in boxes]
+    parts = [pre + f"{srcv}split={n + 1}" + "".join(f"[s{i}]" for i in range(n + 1))]
     last = f"[s{n}]"
     for i, (x, y, w, h) in enumerate(boxes):
         parts.append(f"[s{i}]crop={w}:{h}:{x}:{y},boxblur={strength}[b{i}]")
