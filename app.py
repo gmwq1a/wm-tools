@@ -368,7 +368,7 @@ _RUTUBE_HOST = __import__("re").compile(r"(^|\.)(rutube\.ru|rtbcdn\.ru)$", __imp
 
 def _parse_error_classify(msg):
     m = (msg or "").lower()
-    if any(k in m for k in ("sign in", "log in", "login required", "registered users", "private video", "members-only", "confirm your age", "confirm you")):
+    if any(k in m for k in ("sign in", "log in", "logged in", "logged-in", "login required", "registered users", "private video", "members-only", "confirm your age", "confirm you")):
         return ("auth-required", "需要登录或账号验证才能解析这个平台（常见于 YouTube/IG 对数据中心 IP 的风控）")
     if any(k in m for k in ("429", "too many requests", "captcha", "bot", "unusual traffic")):
         return ("platform-blocked", "平台风控拦截，稍后重试或换平台")
