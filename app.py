@@ -303,7 +303,7 @@ async def audio_fx_job(request: Request, audio: UploadFile = File(...), effect: 
         return JSONResponse({"error": "unknown_effect",
                              "message": f"未知效果: {effect}，可用清单见 /api/audio/effects"}, status_code=400)
     tmpdir = tempfile.mkdtemp(prefix="audjob_")
-    raw = os.path.join(tmpdir, "input" + os.path.splitext(audio.filename or "")[1][:8])
+    raw = os.path.join(tmpdir, "upload" + os.path.splitext(audio.filename or "")[1][:8])
     with open(raw, "wb") as f:
         f.write(await audio.read())
     src_wav = os.path.join(tmpdir, "input.wav")
